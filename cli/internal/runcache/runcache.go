@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/vercel/turborepo/cli/internal/cache"
 	"github.com/vercel/turborepo/cli/internal/colorcache"
+	"github.com/vercel/turborepo/cli/internal/fs"
 	"github.com/vercel/turborepo/cli/internal/globby"
 	"github.com/vercel/turborepo/cli/internal/nodes"
 	"github.com/vercel/turborepo/cli/internal/turbopath"
@@ -23,7 +24,7 @@ import (
 )
 
 // LogReplayer is a function that is responsible for replaying the contents of a given log file
-type LogReplayer = func(logger hclog.Logger, output cli.Ui, logFile turbopath.AbsolutePath)
+type LogReplayer = func(logger hclog.Logger, output cli.Ui, logFile turbopath.AbsoluteSystemPath)
 
 // Opts holds the configurable options for a RunCache instance
 type Opts struct {
@@ -108,14 +109,14 @@ type RunCache struct {
 	cache                  cache.Cache
 	readsDisabled          bool
 	writesDisabled         bool
-	repoRoot               turbopath.AbsolutePath
+	repoRoot               turbopath.AbsoluteSystemPath
 	logReplayer            LogReplayer
 	outputWatcher          OutputWatcher
 	colorCache             *colorcache.ColorCache
 }
 
 // New returns a new instance of RunCache, wrapping the given cache
-func New(cache cache.Cache, repoRoot turbopath.AbsolutePath, opts Opts, colorCache *colorcache.ColorCache) *RunCache {
+func New(cache cache.Cache, repoRoot turbopath.AbsoluteSystemPath, opts Opts, colorCache *colorcache.ColorCache) *RunCache {
 	rc := &RunCache{
 		taskOutputModeOverride: opts.TaskOutputModeOverride,
 		cache:                  cache,
@@ -139,12 +140,12 @@ func New(cache cache.Cache, repoRoot turbopath.AbsolutePath, opts Opts, colorCac
 // and controls access to the task's outputs
 type TaskCache struct {
 	rc                *RunCache
-	repoRelativeGlobs []string
+	repoRelativeGlobs fs.TaskOutputs
 	hash              string
 	pt                *nodes.PackageTask
 	taskOutputMode    util.TaskOutputMode
 	cachingDisabled   bool
-	LogFileName       turbopath.AbsolutePath
+	LogFileName       turbopath.AbsoluteSystemPath
 }
 
 // RestoreOutputs attempts to restore output for the corresponding task from the cache. Returns true
@@ -156,17 +157,18 @@ func (tc TaskCache) RestoreOutputs(ctx context.Context, terminal *cli.PrefixedUi
 		}
 		return false, nil
 	}
-	changedOutputGlobs, err := tc.rc.outputWatcher.GetChangedOutputs(ctx, tc.hash, tc.repoRelativeGlobs)
+	changedOutputGlobs, err := tc.rc.outputWatcher.GetChangedOutputs(ctx, tc.hash, tc.repoRelativeGlobs.Inclusions)
 	if err != nil {
 		logger.Warn(fmt.Sprintf("Failed to check if we can skip restoring outputs for %v: %v. Proceeding to check cache", tc.pt.TaskID, err))
 		terminal.Warn(ui.Dim(fmt.Sprintf("Failed to check if we can skip restoring outputs for %v: %v. Proceeding to check cache", tc.pt.TaskID, err)))
-		changedOutputGlobs = tc.repoRelativeGlobs
+		changedOutputGlobs = tc.repoRelativeGlobs.Inclusions
 	}
 	hasChangedOutputs := len(changedOutputGlobs) > 0
 	if hasChangedOutputs {
 		// Note that we currently don't use the output globs when restoring, but we could in the
-		// future to avoid doing unnecessary file I/O
-		hit, _, _, err := tc.rc.cache.Fetch(tc.rc.repoRoot.ToString(), tc.hash, changedOutputGlobs)
+		// future to avoid doing unnecessary file I/O. We also need to pass along the exclusion
+		// globs as well.
+		hit, _, _, err := tc.rc.cache.Fetch(tc.rc.repoRoot, tc.hash, nil)
 		if err != nil {
 			return false, err
 		} else if !hit {
@@ -225,7 +227,7 @@ func (fwc *fileWriterCloser) Close() error {
 
 // OutputWriter creates a sink suitable for handling the output of the command associated
 // with this task.
-func (tc TaskCache) OutputWriter() (io.WriteCloser, error) {
+func (tc TaskCache) OutputWriter(outputPrefix string) (io.WriteCloser, error) {
 	if tc.cachingDisabled || tc.rc.writesDisabled {
 		return nopWriteCloser{os.Stdout}, nil
 	}
@@ -238,7 +240,7 @@ func (tc TaskCache) OutputWriter() (io.WriteCloser, error) {
 		return nil, err
 	}
 	colorPrefixer := tc.rc.colorCache.PrefixColor(tc.pt.PackageName)
-	prettyTaskPrefix := colorPrefixer(tc.pt.OutputPrefix())
+	prettyTaskPrefix := colorPrefixer(outputPrefix)
 	bufWriter := bufio.NewWriter(output)
 	if _, err := bufWriter.WriteString(fmt.Sprintf("%s: cache hit, replaying output %s\n", prettyTaskPrefix, ui.Dim(tc.hash))); err != nil {
 		// We've already errored, we don't care if there's a further error closing the file we just
@@ -269,24 +271,24 @@ func (tc TaskCache) SaveOutputs(ctx context.Context, logger hclog.Logger, termin
 
 	logger.Debug("caching output", "outputs", tc.repoRelativeGlobs)
 
-	filesToBeCached, err := globby.GlobFiles(tc.rc.repoRoot.ToStringDuringMigration(), tc.repoRelativeGlobs, _emptyIgnore)
+	filesToBeCached, err := globby.GlobFiles(tc.rc.repoRoot.ToStringDuringMigration(), tc.repoRelativeGlobs.Inclusions, tc.repoRelativeGlobs.Exclusions)
 	if err != nil {
 		return err
 	}
 
-	relativePaths := make([]string, len(filesToBeCached))
+	relativePaths := make([]turbopath.AnchoredSystemPath, len(filesToBeCached))
 
 	for index, value := range filesToBeCached {
 		relativePath, err := tc.rc.repoRoot.RelativePathString(value)
 		if err != nil {
-			logger.Error("error", err)
+			logger.Error(fmt.Sprintf("error: %v", err))
 			terminal.Error(fmt.Sprintf("%s%s", ui.ERROR_PREFIX, color.RedString(" %v", fmt.Errorf("File path cannot be made relative: %w", err))))
 			continue
 		}
-		relativePaths[index] = relativePath
+		relativePaths[index] = fs.UnsafeToAnchoredSystemPath(relativePath)
 	}
 
-	if err = tc.rc.cache.Put(tc.pt.Pkg.Dir.ToStringDuringMigration(), tc.hash, duration, relativePaths); err != nil {
+	if err = tc.rc.cache.Put(tc.rc.repoRoot, tc.hash, duration, relativePaths); err != nil {
 		return err
 	}
 	err = tc.rc.outputWatcher.NotifyOutputsWritten(ctx, tc.hash, tc.repoRelativeGlobs)
@@ -302,11 +304,18 @@ func (tc TaskCache) SaveOutputs(ctx context.Context, logger hclog.Logger, termin
 // TaskCache returns a TaskCache instance, providing an interface to the underlying cache specific
 // to this run and the given PackageTask
 func (rc *RunCache) TaskCache(pt *nodes.PackageTask, hash string) TaskCache {
-	logFileName := rc.repoRoot.Join(pt.RepoRelativeLogFile())
+	logFileName := rc.repoRoot.UntypedJoin(pt.RepoRelativeLogFile())
 	hashableOutputs := pt.HashableOutputs()
-	repoRelativeGlobs := make([]string, len(hashableOutputs))
-	for index, output := range hashableOutputs {
-		repoRelativeGlobs[index] = filepath.Join(pt.Pkg.Dir.ToStringDuringMigration(), output)
+	repoRelativeGlobs := fs.TaskOutputs{
+		Inclusions: make([]string, len(hashableOutputs.Inclusions)),
+		Exclusions: make([]string, len(hashableOutputs.Exclusions)),
+	}
+
+	for index, output := range hashableOutputs.Inclusions {
+		repoRelativeGlobs.Inclusions[index] = filepath.Join(pt.Pkg.Dir.ToStringDuringMigration(), output)
+	}
+	for index, output := range hashableOutputs.Exclusions {
+		repoRelativeGlobs.Exclusions[index] = filepath.Join(pt.Pkg.Dir.ToStringDuringMigration(), output)
 	}
 
 	taskOutputMode := pt.TaskDefinition.OutputMode
@@ -326,7 +335,7 @@ func (rc *RunCache) TaskCache(pt *nodes.PackageTask, hash string) TaskCache {
 }
 
 // defaultLogReplayer will try to replay logs back to the given Ui instance
-func defaultLogReplayer(logger hclog.Logger, output cli.Ui, logFileName turbopath.AbsolutePath) {
+func defaultLogReplayer(logger hclog.Logger, output cli.Ui, logFileName turbopath.AbsoluteSystemPath) {
 	logger.Debug("start replaying logs")
 	f, err := logFileName.Open()
 	if err != nil {
