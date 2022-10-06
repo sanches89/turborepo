@@ -49,8 +49,18 @@ module.exports = withNextra({
         permanent: true,
       },
       {
+        source: "/docs/core-concepts/workspaces",
+        destination: "/docs/handbook/workspaces",
+        permanent: true,
+      },
+      {
         source: "/docs/core-concepts/pipelines",
         destination: "/docs/core-concepts/running-tasks",
+        permanent: true,
+      },
+      {
+        source: "/docs/guides/migrate-from-lerna",
+        destination: "/docs/handbook/migrating-to-a-monorepo",
         permanent: true,
       },
       {
@@ -71,7 +81,17 @@ module.exports = withNextra({
       {
         source: "/docs/guides/complimentary-tools",
         permanent: true,
-        destination: "/docs/guides/monorepo-tools",
+        destination: "/docs/handbook",
+      },
+      {
+        source: "/docs/guides/monorepo-tools",
+        permanent: true,
+        destination: "/docs/handbook",
+      },
+      {
+        source: "/docs/glossary",
+        permanent: true,
+        destination: "/docs/handbook",
       },
       {
         source: "/docs/guides/continuous-integration",
